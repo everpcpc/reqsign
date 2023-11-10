@@ -1,6 +1,7 @@
 pub mod external_account;
 pub mod service_account;
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -8,7 +9,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use log::debug;
 
-pub use self::external_account::ExternalAccount;
+pub use self::external_account::{ExternalAccount, FormatType, UrlSourcedCredentials};
 pub use self::service_account::ServiceAccount;
 use super::constants::GOOGLE_APPLICATION_CREDENTIALS;
 use crate::hash::base64_decode;
@@ -43,6 +44,8 @@ pub struct CredentialLoader {
     content: Option<String>,
     disable_env: bool,
     disable_well_known_location: bool,
+    workload_identity_provider: Option<String>,
+    service_account: Option<String>,
 
     credential: Arc<Mutex<Option<Credential>>>,
 }
@@ -57,6 +60,18 @@ impl CredentialLoader {
     /// Disable load from well known location.
     pub fn with_disable_well_known_location(mut self) -> Self {
         self.disable_well_known_location = true;
+        self
+    }
+
+    /// Set workload identity provider.
+    pub fn with_workload_identity_provider(mut self, provider: &str) -> Self {
+        self.workload_identity_provider = Some(provider.to_string());
+        self
+    }
+
+    /// Set service account.
+    pub fn with_service_account(mut self, service_account: &str) -> Self {
+        self.service_account = Some(service_account.to_string());
         self
     }
 
@@ -105,6 +120,10 @@ impl CredentialLoader {
         }
 
         if let Ok(Some(cred)) = self.load_via_well_known_location() {
+            return Ok(Some(cred));
+        }
+
+        if let Ok(Some(cred)) = self.load_via_workload_identity() {
             return Ok(Some(cred));
         }
 
@@ -191,6 +210,50 @@ impl CredentialLoader {
         })?;
 
         Ok(account)
+    }
+
+    fn load_via_workload_identity(&self) -> Result<Option<Credential>> {
+        let workload_identity_provider = if let Some(ref provider) = self.workload_identity_provider
+        {
+            provider
+        } else {
+            return Ok(None);
+        };
+        let service_account = if let Some(ref service_account) = self.service_account {
+            service_account
+        } else {
+            return Ok(None);
+        };
+
+        let url = format!(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/{service_account}/identity?audience={provider}",
+            service_account = service_account,
+            provider = workload_identity_provider,
+        );
+        let headers =
+            HashMap::from_iter(vec![("Metadata-Flavor".to_string(), "Google".to_string())]);
+        let cred = Credential {
+            ty: CredentialType::ExternalAccount,
+            service_account: None,
+            external_account: Some(ExternalAccount {
+                audience: workload_identity_provider.to_string(),
+                subject_token_type: "urn:ietf:params:oauth:token-type:jwt".to_string(),
+                token_url: "https://sts.googleapis.com/v1/token".to_string(),
+                service_account_impersonation_url: Some(format!(
+                    "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account}:generateAccessToken",
+                    service_account = service_account,
+                )),
+                service_account_impersonation: None,
+                credential_source: external_account::CredentialSource::UrlSourced(
+                    UrlSourcedCredentials {
+                        url,
+                        headers,
+                        format: FormatType::Text,
+                    },
+                ),
+            }),
+        };
+        Ok(Some(cred))
     }
 }
 
